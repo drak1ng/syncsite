@@ -1,0 +1,566 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+CONFIG_FILE=".syncsite"
+GITIGNORE_FILE=".gitignore"
+
+usage() {
+  cat <<EOF
+syncsite - sincroniza arquivos alterados com FTP usando Git e git-ftp
+
+Uso:
+  $SCRIPT_NAME --start
+      Prepara o projeto para sincronizacao.
+      Verifica/instala Git, git-ftp e curl, inicia o repositorio Git se
+      necessario, cria o arquivo .syncsite com os dados do FTP e adiciona
+      .syncsite e $SCRIPT_NAME no .gitignore.
+
+  $SCRIPT_NAME --test
+      Valida se tudo foi criado corretamente.
+      Confere Git, git-ftp, curl, repositorio Git, .syncsite, .gitignore e
+      testa a conexao com o FTP sem enviar arquivos.
+
+  $SCRIPT_NAME --config
+      Recria o arquivo .syncsite.
+      Pergunta novamente servidor FTP, login, senha e diretorio raiz. Use este
+      comando para trocar dados de acesso ou corrigir uma configuracao errada.
+
+  $SCRIPT_NAME --upload
+      Envia os arquivos alterados para o FTP.
+      Mostra os arquivos que serao enviados, faz commit automatico com data,
+      pede confirmacao [y/n] e exibe o progresso do upload em porcentagem por
+      arquivo processado.
+
+  $SCRIPT_NAME --help
+      Mostra esta ajuda.
+
+Fluxo recomendado:
+  1. Rode: $SCRIPT_NAME --start
+  2. Confira a conexao: $SCRIPT_NAME --test
+  3. Envie alteracoes: $SCRIPT_NAME --upload
+
+Para refazer a configuracao:
+  $SCRIPT_NAME --config
+
+Arquivos usados:
+  .syncsite   Configuracao privada do FTP.
+  .gitignore  Lista arquivos que nao devem entrar no Git.
+EOF
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+install_with_package_manager() {
+  local package="$1"
+
+  if command_exists brew; then
+    brew install "$package"
+    return
+  fi
+
+  if command_exists apt-get; then
+    sudo apt-get update
+    sudo apt-get install -y "$package"
+    return
+  fi
+
+  if command_exists yum; then
+    sudo yum install -y "$package"
+    return
+  fi
+
+  if command_exists dnf; then
+    sudo dnf install -y "$package"
+    return
+  fi
+
+  echo "Nao encontrei Homebrew, apt-get, yum ou dnf para instalar '$package'."
+  echo "Instale manualmente e rode novamente: $SCRIPT_NAME --start"
+  exit 1
+}
+
+ensure_git_installed() {
+  if command_exists git; then
+    return
+  fi
+
+  echo "Git nao encontrado. Tentando instalar..."
+  install_with_package_manager git
+}
+
+ensure_git_ftp_installed() {
+  if command_exists git-ftp || git ftp --version >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "git-ftp nao encontrado. Tentando instalar..."
+  install_with_package_manager git-ftp
+}
+
+ensure_curl_installed() {
+  if command_exists curl; then
+    return
+  fi
+
+  echo "curl nao encontrado. Tentando instalar..."
+  install_with_package_manager curl
+}
+
+ensure_git_repo() {
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "Repositorio Git nao encontrado. Iniciando git..."
+  git init
+}
+
+ensure_git_identity() {
+  if [ -z "$(git config user.name || true)" ]; then
+    git config user.name "Syncsite"
+  fi
+
+  if [ -z "$(git config user.email || true)" ]; then
+    git config user.email "syncsite@localhost"
+  fi
+}
+
+ensure_gitignore_entry() {
+  local entry="$1"
+
+  touch "$GITIGNORE_FILE"
+
+  if ! grep -Fxq "$entry" "$GITIGNORE_FILE"; then
+    printf '%s\n' "$entry" >> "$GITIGNORE_FILE"
+  fi
+}
+
+ensure_gitignore() {
+  ensure_gitignore_entry "$CONFIG_FILE"
+  ensure_gitignore_entry "$SCRIPT_NAME"
+}
+
+read_required_value() {
+  local label="$1"
+  local value=""
+
+  while [ -z "$value" ]; do
+    read -r -p "$label: " value
+
+    if [ -z "$value" ]; then
+      echo "Valor obrigatorio."
+    fi
+  done
+
+  printf '%s' "$value"
+}
+
+clean_config_value() {
+  printf '%s' "$1" | tr -d '\r\n'
+}
+
+quote_config_value() {
+  local value="$1"
+
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+
+  printf '"%s"' "$value"
+}
+
+save_config_values() {
+  render_config_values > "$CONFIG_FILE"
+
+  chmod 600 "$CONFIG_FILE"
+}
+
+render_config_values() {
+  printf 'FTP_HOST=%s\n' "$(quote_config_value "$FTP_HOST")"
+  printf 'FTP_USER=%s\n' "$(quote_config_value "$FTP_USER")"
+  printf 'FTP_PASSWORD=%s\n' "$(quote_config_value "$FTP_PASSWORD")"
+  printf 'FTP_ROOT=%s\n' "$(quote_config_value "$FTP_ROOT")"
+}
+
+write_config() {
+  local ftp_host ftp_user ftp_password ftp_root
+
+  echo "Informe os dados do FTP."
+  ftp_host="$(clean_config_value "$(read_required_value "Servidor FTP, exemplo ftp.seusite.com")")"
+  ftp_user="$(clean_config_value "$(read_required_value "Login")")"
+  ftp_password="$(clean_config_value "$(read_required_value "Senha")")"
+  ftp_root="$(clean_config_value "$(read_required_value "Diretorio raiz no FTP, exemplo /public_html")")"
+
+  FTP_HOST="$ftp_host"
+  FTP_USER="$ftp_user"
+  FTP_PASSWORD="$ftp_password"
+  FTP_ROOT="$ftp_root"
+  save_config_values
+  echo "Configuracao criada em $CONFIG_FILE."
+}
+
+ensure_config() {
+  if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Arquivo $CONFIG_FILE nao encontrado."
+    write_config
+  fi
+}
+
+load_config() {
+  local original_ftp_host original_ftp_user original_ftp_password original_ftp_root
+
+  ensure_config
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+
+  original_ftp_host="$FTP_HOST"
+  original_ftp_user="$FTP_USER"
+  original_ftp_password="$FTP_PASSWORD"
+  original_ftp_root="$FTP_ROOT"
+
+  FTP_HOST="$(clean_config_value "$FTP_HOST")"
+  FTP_USER="$(clean_config_value "$FTP_USER")"
+  FTP_PASSWORD="$(clean_config_value "$FTP_PASSWORD")"
+  FTP_ROOT="$(clean_config_value "$FTP_ROOT")"
+
+  : "${FTP_HOST:?FTP_HOST nao configurado em $CONFIG_FILE}"
+  : "${FTP_USER:?FTP_USER nao configurado em $CONFIG_FILE}"
+  : "${FTP_PASSWORD:?FTP_PASSWORD nao configurado em $CONFIG_FILE}"
+  : "${FTP_ROOT:?FTP_ROOT nao configurado em $CONFIG_FILE}"
+
+  if [ "$FTP_HOST" != "$original_ftp_host" ] ||
+    [ "$FTP_USER" != "$original_ftp_user" ] ||
+    [ "$FTP_PASSWORD" != "$original_ftp_password" ] ||
+    [ "$FTP_ROOT" != "$original_ftp_root" ] ||
+    [ "$(cat "$CONFIG_FILE")" != "$(render_config_values)" ]; then
+    save_config_values
+    echo "Arquivo $CONFIG_FILE normalizado."
+  fi
+}
+
+ftp_url() {
+  local root="$FTP_ROOT"
+
+  root="${root#/}"
+  if [ -n "$root" ]; then
+    printf 'ftp://%s/%s' "$FTP_HOST" "$root"
+  else
+    printf 'ftp://%s' "$FTP_HOST"
+  fi
+}
+
+git_ftp_command() {
+  local action="$1"
+  shift
+
+  git ftp "$action" \
+    --user "$FTP_USER" \
+    --passwd "$FTP_PASSWORD" \
+    "$@" \
+    "$(ftp_url)"
+}
+
+run_git_ftp_with_progress() {
+  local action="$1"
+  local output_status
+
+  set +e
+  git_ftp_command "$action" 2>&1 | while IFS= read -r line; do
+    if [[ "$line" =~ ^\[([0-9]+)[[:space:]]of[[:space:]]([0-9]+)\] ]]; then
+      local current="${BASH_REMATCH[1]}"
+      local total="${BASH_REMATCH[2]}"
+      local percent=0
+
+      if [ "$total" -gt 0 ]; then
+        percent=$((current * 100 / total))
+      fi
+
+      printf '[%3d%%] %s\n' "$percent" "$line"
+    else
+      printf '%s\n' "$line"
+    fi
+  done
+  output_status="${PIPESTATUS[0]}"
+  set -e
+
+  return "$output_status"
+}
+
+has_any_commit() {
+  git rev-parse --verify HEAD >/dev/null 2>&1
+}
+
+ensure_initial_commit_if_needed() {
+  if has_any_commit; then
+    return
+  fi
+
+  if git status --porcelain --untracked-files=all | grep -q .; then
+    git add -A
+    git commit -m "Initial syncsite commit"
+  else
+    git commit --allow-empty -m "Initial syncsite commit"
+  fi
+}
+
+commit_current_changes_if_needed() {
+  local changed_files
+
+  changed_files="$(git status --porcelain --untracked-files=all)"
+  if [ -z "$changed_files" ]; then
+    return
+  fi
+
+  git add -A
+  git commit -m "Syncsite upload $(date '+%Y-%m-%d %H:%M:%S')"
+}
+
+print_current_changes() {
+  local changed_files
+
+  changed_files="$(git status --porcelain --untracked-files=all)"
+  if [ -z "$changed_files" ]; then
+    echo "Nenhum arquivo local alterado antes do commit automatico."
+    return
+  fi
+
+  echo "Arquivos locais alterados que serao commitados antes do upload:"
+  printf '%s\n' "$changed_files" | sed 's/^/  /'
+}
+
+test_ok() {
+  printf '[OK] %s\n' "$1"
+}
+
+test_fail() {
+  printf '[ERRO] %s\n' "$1"
+}
+
+check_gitignore_entry() {
+  local entry="$1"
+
+  [ -f "$GITIGNORE_FILE" ] && grep -Fxq "$entry" "$GITIGNORE_FILE"
+}
+
+run_test() {
+  local errors=0 connection_output connection_status
+
+  echo "Validando syncsite..."
+
+  if command_exists git; then
+    test_ok "Git instalado: $(git --version)"
+  else
+    test_fail "Git nao instalado. Rode: $SCRIPT_NAME --start"
+    errors=$((errors + 1))
+  fi
+
+  if command_exists git-ftp || git ftp --version >/dev/null 2>&1; then
+    test_ok "git-ftp instalado: $(git ftp --version 2>/dev/null || git-ftp --version)"
+  else
+    test_fail "git-ftp nao instalado. Rode: $SCRIPT_NAME --start"
+    errors=$((errors + 1))
+  fi
+
+  if command_exists curl; then
+    test_ok "curl instalado: $(curl --version | head -n 1)"
+  else
+    test_fail "curl nao instalado. Rode: $SCRIPT_NAME --start"
+    errors=$((errors + 1))
+  fi
+
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    test_ok "Repositorio Git iniciado."
+    if [ -n "$(git config user.name || true)" ] && [ -n "$(git config user.email || true)" ]; then
+      test_ok "Identidade Git configurada para commits automaticos."
+    else
+      test_fail "Identidade Git nao configurada. Rode: $SCRIPT_NAME --start"
+      errors=$((errors + 1))
+    fi
+  else
+    test_fail "Repositorio Git nao iniciado. Rode: $SCRIPT_NAME --start"
+    errors=$((errors + 1))
+  fi
+
+  if [ -f "$CONFIG_FILE" ]; then
+    test_ok "Arquivo $CONFIG_FILE encontrado."
+  else
+    test_fail "Arquivo $CONFIG_FILE nao encontrado. Rode: $SCRIPT_NAME --start"
+    errors=$((errors + 1))
+  fi
+
+  if check_gitignore_entry "$CONFIG_FILE"; then
+    test_ok "$CONFIG_FILE esta no $GITIGNORE_FILE."
+  else
+    test_fail "$CONFIG_FILE nao esta no $GITIGNORE_FILE."
+    errors=$((errors + 1))
+  fi
+
+  if check_gitignore_entry "$SCRIPT_NAME"; then
+    test_ok "$SCRIPT_NAME esta no $GITIGNORE_FILE."
+  else
+    test_fail "$SCRIPT_NAME nao esta no $GITIGNORE_FILE."
+    errors=$((errors + 1))
+  fi
+
+  if [ "$errors" -ne 0 ]; then
+    echo
+    echo "Corrija os itens acima antes de testar a conexao FTP."
+    exit 1
+  fi
+
+  load_config
+
+  test_ok "Configuracao carregada para $(ftp_url)."
+  echo "Testando conexao FTP sem enviar arquivos..."
+
+  set +e
+  connection_output="$(
+    curl \
+      --silent \
+      --show-error \
+      --fail \
+      --list-only \
+      --user "$FTP_USER:$FTP_PASSWORD" \
+      "$(ftp_url)/" 2>&1
+  )"
+  connection_status=$?
+  set -e
+
+  if [ "$connection_status" -eq 0 ]; then
+    test_ok "FTP conectou corretamente."
+    if [ -n "$connection_output" ]; then
+      printf '%s\n' "$connection_output" | sed 's/^/  /'
+    fi
+    echo
+    echo "Teste concluido com sucesso."
+    return
+  fi
+
+  test_fail "Nao foi possivel conectar ao FTP."
+  printf '%s\n' "$connection_output" | sed 's/^/  /'
+  exit "$connection_status"
+}
+
+run_start() {
+  ensure_git_installed
+  ensure_git_ftp_installed
+  ensure_curl_installed
+  ensure_git_repo
+  ensure_git_identity
+  ensure_gitignore
+  ensure_config
+  ensure_initial_commit_if_needed
+
+  echo "Tudo pronto. Use: $SCRIPT_NAME --upload"
+}
+
+run_config() {
+  local answer
+
+  ensure_gitignore
+
+  if [ -f "$CONFIG_FILE" ]; then
+    read -r -p "O arquivo $CONFIG_FILE ja existe. Deseja recriar? [y/n] " answer
+    case "$answer" in
+      y|Y|yes|YES)
+        ;;
+      *)
+        echo "Configuracao mantida."
+        return
+        ;;
+    esac
+  fi
+
+  write_config
+  echo "Configuracao recriada. Rode: $SCRIPT_NAME --test"
+}
+
+run_upload() {
+  local dry_run_output answer git_ftp_action
+
+  ensure_git_installed
+  ensure_git_ftp_installed
+  ensure_git_repo
+  ensure_git_identity
+  ensure_gitignore
+  load_config
+
+  print_current_changes
+  commit_current_changes_if_needed
+  ensure_initial_commit_if_needed
+
+  echo
+  echo "Arquivos que o git-ftp pretende enviar:"
+  set +e
+  dry_run_output="$(git_ftp_command push --dry-run 2>&1)"
+  local dry_run_status=$?
+  set -e
+
+  if [ "$dry_run_status" -ne 0 ]; then
+    if printf '%s\n' "$dry_run_output" | grep -Eiq 'no uploaded sha1|unknown sha1|not found|could not get last commit|initial push|resource does not exist'; then
+      git_ftp_action="init"
+      echo "Primeiro envio detectado. Usando git ftp init..."
+      set +e
+      dry_run_output="$(git_ftp_command init --dry-run 2>&1)"
+      dry_run_status=$?
+      set -e
+    else
+      echo "$dry_run_output"
+      exit "$dry_run_status"
+    fi
+  else
+    git_ftp_action="push"
+  fi
+
+  if [ "$dry_run_status" -ne 0 ]; then
+    echo "$dry_run_output"
+    exit "$dry_run_status"
+  fi
+
+  if [ -n "$dry_run_output" ]; then
+    printf '%s\n' "$dry_run_output" | sed 's/^/  /'
+  else
+    echo "  Nenhum arquivo pendente para upload."
+  fi
+
+  echo
+  read -r -p "Tem certeza que deseja enviar para o FTP? [y/n] " answer
+  case "$answer" in
+    y|Y|yes|YES)
+      echo "Enviando arquivos..."
+      run_git_ftp_with_progress "$git_ftp_action"
+      echo "Upload concluido."
+      ;;
+    *)
+      echo "Upload cancelado."
+      ;;
+  esac
+}
+
+case "${1:-}" in
+  --start)
+    run_start
+    ;;
+  --upload)
+    run_upload
+    ;;
+  --test)
+    run_test
+    ;;
+  --config)
+    run_config
+    ;;
+  -h|--help|"")
+    usage
+    ;;
+  *)
+    echo "Comando invalido: $1"
+    usage
+    exit 1
+    ;;
+esac
