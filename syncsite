@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_NAME="$(basename "$0")"
 CONFIG_FILE=".syncsite"
 GITIGNORE_FILE=".gitignore"
+GIT_FTP_BIN="${SYNCSITE_GIT_FTP:-}"
 
 usage() {
   cat <<EOF
@@ -31,7 +32,8 @@ Uso:
       Envia os arquivos alterados para o FTP.
       Mostra os arquivos que serao enviados, faz commit automatico com data,
       pede confirmacao [y/n] e exibe o progresso do upload em porcentagem por
-      arquivo processado.
+      arquivo processado. No primeiro uso, cria a base do git-ftp sem enviar
+      todos os arquivos do projeto.
 
   $SCRIPT_NAME --help
       Mostra esta ajuda.
@@ -93,12 +95,28 @@ ensure_git_installed() {
 }
 
 ensure_git_ftp_installed() {
-  if command_exists git-ftp || git ftp --version >/dev/null 2>&1; then
+  if [ -n "$GIT_FTP_BIN" ] && [ -x "$GIT_FTP_BIN" ]; then
+    return
+  fi
+
+  if [ -x "./git-ftp" ]; then
+    GIT_FTP_BIN="./git-ftp"
+    return
+  fi
+
+  if command_exists git-ftp; then
+    GIT_FTP_BIN="$(command -v git-ftp)"
+    return
+  fi
+
+  if git ftp --version >/dev/null 2>&1; then
+    GIT_FTP_BIN="git ftp"
     return
   fi
 
   echo "git-ftp nao encontrado. Tentando instalar..."
   install_with_package_manager git-ftp
+  GIT_FTP_BIN="$(command -v git-ftp)"
 }
 
 ensure_curl_installed() {
@@ -142,6 +160,7 @@ ensure_gitignore_entry() {
 ensure_gitignore() {
   ensure_gitignore_entry "$CONFIG_FILE"
   ensure_gitignore_entry "$SCRIPT_NAME"
+  ensure_gitignore_entry "git-ftp"
 }
 
 read_required_value() {
@@ -258,11 +277,27 @@ git_ftp_command() {
   local action="$1"
   shift
 
-  git ftp "$action" \
-    --user "$FTP_USER" \
-    --passwd "$FTP_PASSWORD" \
-    "$@" \
-    "$(ftp_url)"
+  if [ "$GIT_FTP_BIN" = "git ftp" ]; then
+    git ftp "$action" \
+      --user "$FTP_USER" \
+      --passwd "$FTP_PASSWORD" \
+      "$@" \
+      "$(ftp_url)"
+  else
+    "$GIT_FTP_BIN" "$action" \
+      --user "$FTP_USER" \
+      --passwd "$FTP_PASSWORD" \
+      "$@" \
+      "$(ftp_url)"
+  fi
+}
+
+git_ftp_version() {
+  if [ "$GIT_FTP_BIN" = "git ftp" ]; then
+    git ftp --version
+  else
+    "$GIT_FTP_BIN" --version
+  fi
 }
 
 run_git_ftp_with_progress() {
@@ -293,6 +328,18 @@ run_git_ftp_with_progress() {
 
 has_any_commit() {
   git rev-parse --verify HEAD >/dev/null 2>&1
+}
+
+current_commit() {
+  git rev-parse HEAD
+}
+
+previous_commit() {
+  git rev-parse HEAD~1
+}
+
+is_missing_remote_log_error() {
+  printf '%s\n' "$1" | grep -Eiq 'no uploaded sha1|unknown sha1|not found|could not get last commit|initial push|resource does not exist'
 }
 
 ensure_initial_commit_if_needed() {
@@ -359,10 +406,11 @@ run_test() {
     errors=$((errors + 1))
   fi
 
-  if command_exists git-ftp || git ftp --version >/dev/null 2>&1; then
-    test_ok "git-ftp instalado: $(git ftp --version 2>/dev/null || git-ftp --version)"
+  ensure_git_ftp_installed
+  if [ -n "$GIT_FTP_BIN" ]; then
+    test_ok "git-ftp disponivel: $(git_ftp_version)"
   else
-    test_fail "git-ftp nao instalado. Rode: $SCRIPT_NAME --start"
+    test_fail "git-ftp nao disponivel. Rode: $SCRIPT_NAME --start"
     errors=$((errors + 1))
   fi
 
@@ -481,7 +529,7 @@ run_config() {
 }
 
 run_upload() {
-  local dry_run_output answer git_ftp_action
+  local dry_run_output answer git_ftp_action base_commit="" has_base_commit="false"
 
   ensure_git_installed
   ensure_git_ftp_installed
@@ -489,6 +537,11 @@ run_upload() {
   ensure_git_identity
   ensure_gitignore
   load_config
+
+  if has_any_commit; then
+    base_commit="$(current_commit)"
+    has_base_commit="true"
+  fi
 
   print_current_changes
   commit_current_changes_if_needed
@@ -502,13 +555,26 @@ run_upload() {
   set -e
 
   if [ "$dry_run_status" -ne 0 ]; then
-    if printf '%s\n' "$dry_run_output" | grep -Eiq 'no uploaded sha1|unknown sha1|not found|could not get last commit|initial push|resource does not exist'; then
-      git_ftp_action="init"
-      echo "Primeiro envio detectado. Usando git ftp init..."
+    if is_missing_remote_log_error "$dry_run_output"; then
+      echo "Base do git-ftp nao encontrada no servidor."
+      echo "Criando base sem enviar todos os arquivos..."
+
+      if [ "$has_base_commit" = "true" ]; then
+        git_ftp_command catchup --commit "$base_commit"
+      elif previous_commit >/dev/null 2>&1; then
+        git_ftp_command catchup --commit "$(previous_commit)"
+      else
+        git_ftp_command catchup --commit "$(current_commit)"
+        echo "Base criada no commit atual. Nao ha alteracoes posteriores para enviar agora."
+        echo "Altere arquivos e rode novamente: $SCRIPT_NAME --upload"
+        return
+      fi
+
       set +e
-      dry_run_output="$(git_ftp_command init --dry-run 2>&1)"
+      dry_run_output="$(git_ftp_command push --dry-run 2>&1)"
       dry_run_status=$?
       set -e
+      git_ftp_action="push"
     else
       echo "$dry_run_output"
       exit "$dry_run_status"
