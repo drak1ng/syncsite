@@ -9,6 +9,33 @@ struct Site: Codable, Identifiable, Equatable {
     var projectURL: URL {
         URL(fileURLWithPath: projectPath)
     }
+
+    init(
+        id: UUID = UUID(),
+        name: String,
+        projectPath: String,
+        modifiedAfter: Date? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.projectPath = projectPath
+        self.modifiedAfter = modifiedAfter
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case projectPath
+        case modifiedAfter
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try container.decode(String.self, forKey: .name)
+        projectPath = try container.decode(String.self, forKey: .projectPath)
+        modifiedAfter = try container.decodeIfPresent(Date.self, forKey: .modifiedAfter)
+    }
 }
 
 enum SiteStore {
